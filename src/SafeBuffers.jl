@@ -1,82 +1,46 @@
 module SafeBuffers
 
-using Base: Semaphore, acquire, release
-
 export withbuffer
 
-export SafeBuffer
+export BufferPool
 
 """
-    SafeBuffer{T,N}
-    SafeBuffer(n, reftype)
-    SafeBuffer(n, buffer::AbstractArray)
-    SafeBuffer(n, arrtype, dims...)
+    BufferPool(n, factory)
 
 A type with `n` lockable mutable buffers.
 
 # Examples
 
 ```jldoctest
-julia> b1 = SafeBuffer(2, Ref{Int})
-SafeBuffer{Base.RefValue{Int64}, 2}(🔒: 0, size = ())
+julia> b1 = BufferPool(2, () -> Ref{Int}())
+BufferPool{Base.RefValue{Int64}}(🔒: 0 of 2, size = ())
 
-julia> b2 = SafeBuffer(2, Vector{Int}, 2)
-SafeBuffer{Vector{Int64}, 2}(🔒: 0, size = (2,))
+julia> b2 = BufferPool(2, () -> Vector{Int}(undef, 2))
+BufferPool{Vector{Int64}}(🔒: 0 of 2, size = (2,))
 
-julia> b3 = SafeBuffer(Threads.nthreads(), Vector{Int}, 2)
-SafeBuffer{Vector{Int64}, 8}(🔒: 0, size = (2,))
+julia> b3 = BufferPool(Threads.nthreads(), () -> Matrix{Int}(undef, 2, 2))
+BufferPool{Vector{Int64}}(🔒: 0 of 8, size = (2,2))
 ```
 """
-struct SafeBuffer{T,N}
-    held::Semaphore
-    locks::NTuple{N,ReentrantLock}
+struct BufferPool{T}
+    N::Int
+    condition::Threads.Condition
     buffers::Vector{T}
 end
 
-function SafeBuffer(n, reftype::Type{Ref{T}}) where T
-    return SafeBuffer(Semaphore(n), ntuple(_ -> ReentrantLock(), n),
-        [ Ref{T}() for _ in 1:n ])
+function BufferPool(n, factory)
+    n > 0 || throw(ArgumentError("must have at least 1 buffer; got n = $n"))
+    BufferPool(n, Threads.Condition(), [ factory() for _ in 1:n ])
 end
 
-function SafeBuffer(n, buffer::AbstractArray)
-    return SafeBuffer(Semaphore(n), ntuple(_ -> ReentrantLock(), n),
-        [ similar(buffer) for _ in 1:n ])
-end
-
-function SafeBuffer(n, arrtype::Type{<:AbstractArray{T,N}}, dims::Vararg{Int,N}) where {T,N}
-    return SafeBuffer(n, arrtype, dims)
-end
-
-function SafeBuffer(n, arrtype::Type{<:AbstractArray{T,N}}, dims::NTuple{N,Int}) where {T,N}
-    return SafeBuffer(Semaphore(n), ntuple(_ -> ReentrantLock(), n),
-        [ Array{T,N}(undef, dims) for _ in 1:n ])
-end
-
-function Base.show(io::IO, buffer::SafeBuffer)
-    print(io, "$(typeof(buffer))(🔒: $(buffer.held.curr_cnt), size = $(size(buffer.buffers[1])))")
-end
-
-function acquirebuffer(buffer)
-    # buffer.held.curr_cnt === buffer.held.sem_size && @debug "Buffer fully subscribed" Threads.threadid() stacktrace()
-    acquire(buffer.held)
-    @inbounds for ci in eachindex(buffer.locks)
-        if trylock(buffer.locks[ci])
-            return buffer.locks[ci], buffer.buffers[ci]
-        end
-    end
-
-    return nothing
-end
-
-function releasebuffer(lock, buffer)
-    unlock(lock)
-    release(buffer.held)
+function Base.show(io::IO, pool::BufferPool)
+    print(io, typeof(pool), "(🔒: $(pool.N - length(pool.buffers)) of $(pool.N), size = $(size(first(pool.buffers))))")
 end
 
 """
-    withbuffer(f, buffer)
+    withbuffer(f, pool)
 
-Acquire a buffer in the `SafeBuffer` and call `f` on the acquired buffer.
+Acquire a buffer in the `BufferPool` and call `f` on the acquired buffer.
 
 `withbuffer` will wait as necessary for a buffer to become available. `f` must take one
 argument, the buffer to be used/mutated.
@@ -91,16 +55,22 @@ julia> withbuffer(b2) do buf
 5
 ```
 """
-function withbuffer(f, buffer)
-    l, buf = acquirebuffer(buffer)
-    local ret
-    try
-        ret = f(buf)
-    finally
-        releasebuffer(l, buffer)
+function withbuffer(f, pool)
+    buf = lock(pool.condition) do
+        while isempty(pool.buffers)
+            wait(pool.condition)
+        end
+        pop!(pool.buffers)
     end
 
-    return ret
+    try
+        f(buf)
+    finally
+        lock(pool.condition) do
+            push!(pool.buffers, buf)
+            notify(pool.condition)
+        end
+    end
 end
 
 end
